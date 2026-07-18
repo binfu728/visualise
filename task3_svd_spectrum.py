@@ -1,14 +1,7 @@
 """
-Task 3 — Singular Value Spectrum.
-Extracts N=2000 global features from each model, mean-centers (no normalization),
-computes SVD, normalizes by sigma_max, and plots singular values in descending
-order on log-Y scale.
-
-Features are cached to .pt files for fast re-runs.
-
-Usage:
-    conda activate dinov3-mmlab-wj2
-    python task3_svd_spectrum.py
+Task 3 — Singular Value Spectrum (σ/σmax, log-Y).
+N=2000 per model: dinov3, fusion_old, fusion_9999, fusion_23999, fusion_full, OlmoEarth.
+Mean-center, SVD, normalize by σ_max, plot. Features cached to .pt.
 """
 
 import sys
@@ -16,12 +9,10 @@ import types
 import random
 import glob
 import os
-
 import numpy as np
 import pandas as pd
 import torch
 import cv2
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -33,26 +24,28 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# ── dinov3 limx bootstrap ──────────────────────────────────────────────────
 sys.modules["dinov3.models.RS_vision_transformer"] = types.ModuleType("x")
 eu = types.ModuleType("dinov3.eval.utils")
 eu.ModelWithIntermediateLayers = type("M", (), {})
 sys.modules["dinov3.eval.utils"] = eu
 sys.path.insert(0, "/mnt/ht2-nas2/00-model/00-limx/Codes/dinov3-main")
-from dinov3.models.vision_transformer import vit_small, vit_large
+from dinov3.models.vision_transformer import vit_large
+from dinov3.models.croma_vit_crosself_integration_opimize import MultiLayerCustomEncoder
 
-# ── OlmoEarth bootstrap ────────────────────────────────────────────────────
 _OLMO_ROOT = "/mnt/ht2-nas2/00-model/00-fb/olmo_test/olmoearth_inference_v2_1"
 sys.path.insert(0, _OLMO_ROOT)
 
-# ── Paths ──────────────────────────────────────────────────────────────────
-VITS_CKPT   = "/mnt/ht2-nas2/00-model/00-fb/mmseg_data/weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
-FUSION_CKPT = "/mnt/ht2-nas2/00-model/00-common/weights/20260709/weights.pth"
-OLMO_CKPT   = "/mnt/ht2-nas2/EO_test/model/OlmoEarth-v1-Base/weights.pth"
-OLMO_H5_DIR = "/mnt/ht2-nas2/00-model/00-fb/olmo_test/inference_data"
-POTSDAM_DIR = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir"
-OUT_DIR     = "/mnt/qh2-nas3/00-model/00-fb/visualise"
-CACHE_DIR   = os.path.join(OUT_DIR, "cache")
+VITS_CKPT    = "/mnt/ht2-nas2/models/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+FUSION_CKPT  = "/mnt/ht2-nas2/00-model/00-common/weights/20260709/weights.pth"
+NEW_CKPT     = "/mnt/qh2-nas3/00-model/00-limx/Dinov3/ckpt/stage2+stage3-zhejiang/23999.pth"
+NEW2_CKPT    = "/mnt/qh2-nas3/00-model/00-limx/Dinov3/ckpt/stage2+stage3-zhejiang/9999.pth"
+OLMO_CKPT    = "/mnt/ht2-nas2/EO_test/model/OlmoEarth-v1-Base/weights.pth"
+OLMO_H5_DIR  = "/mnt/ht2-nas2/00-model/00-fb/olmo_test/inference_data"
+POTSDAM_DIR  = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir"
+OUT_DIR      = "/mnt/qh2-nas3/00-model/00-fb/visualise"
+CACHE_DIR    = os.path.join(OUT_DIR, "cache")
+FUS_SIZE     = 480
+FUS_GRID     = FUS_SIZE // 16
 
 POTSDAM_MEAN = np.array([97.61828308705, 92.50345435337714, 85.8699012576488])
 POTSDAM_STD  = np.array([36.295481104983764, 35.3808408869616, 36.78625007116312])
@@ -61,10 +54,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers — checkpoint
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _unwrap_checkpoint(ckpt):
     if not isinstance(ckpt, dict):
@@ -75,10 +64,6 @@ def _unwrap_checkpoint(ckpt):
     return ckpt
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers — dinov3 / fusion dinov3
-# ═══════════════════════════════════════════════════════════════════════════
-
 def load_potsdam_image(filepath, img_size=512):
     img = cv2.cvtColor(cv2.imread(filepath, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
@@ -88,7 +73,7 @@ def load_potsdam_image(filepath, img_size=512):
 
 
 def build_dinov3(img_size=512):
-    vit = vit_small(patch_size=16, img_size=img_size,
+    vit = vit_large(patch_size=16, img_size=img_size,
                     n_storage_tokens=4, layerscale_init=1e-5)
     ckpt = torch.load(VITS_CKPT, map_location="cpu", weights_only=False)
     ckpt = _unwrap_checkpoint(ckpt)
@@ -98,28 +83,63 @@ def build_dinov3(img_size=512):
     return vit.to(DEVICE).eval()
 
 
-def build_fusion_dino(img_size=512):
+def build_fusion_old(img_size=512):
     vit = vit_large(patch_size=16, img_size=img_size,
                     n_storage_tokens=0, layerscale_init=1e-5)
     ckpt = torch.load(FUSION_CKPT, map_location="cpu", weights_only=False)
     ckpt = _unwrap_checkpoint(ckpt)
-    sd = {}
-    for k, v in ckpt.items():
-        if isinstance(v, torch.Tensor) and k.startswith("backbone."):
-            sd[k[len("backbone."):]] = v
+    sd = {k[len("backbone."):]: v for k, v in ckpt.items()
+          if isinstance(v, torch.Tensor) and k.startswith("backbone.")}
     info = vit.load_state_dict(sd, strict=False)
-    print(f"[fusion_dino] matched={len(sd)-len(info.unexpected_keys)} "
+    print(f"[fusion_old] matched={len(sd)-len(info.unexpected_keys)} "
           f"missing={len(info.missing_keys)} unexpected={len(info.unexpected_keys)}")
     return vit.to(DEVICE).eval()
 
 
-def _extract_dino_global_batched(vit, img_size, filepaths, batch_size=64):
-    """Extract cls tokens from vit_small/fusion, processing images in batches.
+def build_fusion_23999(img_size=512):
+    vit = vit_large(patch_size=16, img_size=img_size,
+                    n_storage_tokens=4, layerscale_init=1e-5)
+    ckpt = torch.load(NEW_CKPT, map_location="cpu", weights_only=False)
+    sd = {k[len("backbone."):]: v for k, v in ckpt.items()
+          if isinstance(v, torch.Tensor) and k.startswith("backbone.")}
+    info = vit.load_state_dict(sd, strict=False)
+    print(f"[fusion_23999] matched={len(sd)-len(info.unexpected_keys)} "
+          f"missing={len(info.missing_keys)} unexpected={len(info.unexpected_keys)}")
+    return vit.to(DEVICE).eval()
 
-    Determines last-block index from vit.embed_dim (384→vit_small/12 blk,
-    1024→vit_large/24 blk).
-    """
-    last_block = {384: 11, 1024: 23}[vit.embed_dim]
+
+def build_fusion_9999(img_size=512):
+    vit = vit_large(patch_size=16, img_size=img_size,
+                    n_storage_tokens=4, layerscale_init=1e-5)
+    ckpt = torch.load(NEW2_CKPT, map_location="cpu", weights_only=False)
+    sd = {k[len("backbone."):]: v for k, v in ckpt.items()
+          if isinstance(v, torch.Tensor) and k.startswith("backbone.")}
+    info = vit.load_state_dict(sd, strict=False)
+    print(f"[fusion_9999] matched={len(sd)-len(info.unexpected_keys)} "
+          f"missing={len(info.missing_keys)} unexpected={len(info.unexpected_keys)}")
+    return vit.to(DEVICE).eval()
+
+
+def build_fusion_full():
+    vit = vit_large(patch_size=16, img_size=FUS_SIZE,
+                    n_storage_tokens=4, layerscale_init=1e-5)
+    mce = MultiLayerCustomEncoder(dim=1024, depth=3, num_heads=8,
+                                  num_patches_q=FUS_GRID ** 2,
+                                  num_patches_kv=144, ff_mult=4)
+    ckpt = torch.load(NEW_CKPT, map_location="cpu", weights_only=False)
+    sd_vit = {k[len("backbone."):]: v for k, v in ckpt.items()
+              if isinstance(v, torch.Tensor) and k.startswith("backbone.")}
+    sd_mce = {k[len("fusion_backbone."):]: v for k, v in ckpt.items()
+              if isinstance(v, torch.Tensor) and k.startswith("fusion_backbone.")}
+    vi = vit.load_state_dict(sd_vit, strict=False)
+    mi = mce.load_state_dict(sd_mce, strict=False)
+    print(f"[fusion_full] vit={len(sd_vit)-len(vi.unexpected_keys)} "
+          f"mce={len(sd_mce)-len(mi.unexpected_keys)}")
+    return vit.to(DEVICE).eval(), mce.to(DEVICE).eval()
+
+
+def _extract_vit_global_batched(vit, img_size, filepaths, batch_size=64):
+    last_block = 23
     feats = []
     n = len(filepaths)
     for start in range(0, n, batch_size):
@@ -130,9 +150,8 @@ def _extract_dino_global_batched(vit, img_size, filepaths, batch_size=64):
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
             out = vit.get_intermediate_layers(
                 x_batch, n=[last_block],
-                return_class_token=True, reshape=False, norm=True
-            )
-        _, cls_tok = out[0]  # cls_tok: [B, D]
+                return_class_token=True, reshape=False, norm=True)
+        _, cls_tok = out[0]
         for b in range(cls_tok.shape[0]):
             feats.append(cls_tok[b].cpu())
         if end % 400 == 0 or end >= n:
@@ -141,16 +160,50 @@ def _extract_dino_global_batched(vit, img_size, filepaths, batch_size=64):
 
 
 def extract_dinov3_global(vit, img_size, filepaths):
-    return _extract_dino_global_batched(vit, img_size, filepaths)
+    return _extract_vit_global_batched(vit, img_size, filepaths)
 
 
-def extract_fusion_dino_global(vit, img_size, filepaths):
-    return _extract_dino_global_batched(vit, img_size, filepaths)
+def extract_fusion_old_global(vit, img_size, filepaths):
+    return _extract_vit_global_batched(vit, img_size, filepaths)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers — OlmoEarth
-# ═══════════════════════════════════════════════════════════════════════════
+def extract_fusion_23999_global(vit, img_size, filepaths):
+    return _extract_vit_global_batched(vit, img_size, filepaths)
+
+
+def extract_fusion_9999_global(vit, img_size, filepaths):
+    return _extract_vit_global_batched(vit, img_size, filepaths)
+
+
+def extract_fusion_full_global(vit, mce, filepaths, batch_size=64):
+    N = len(filepaths)
+    feats = []
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        xs = [load_potsdam_image(fp, FUS_SIZE).to(DEVICE, non_blocking=True)
+              for fp in filepaths[start:end]]
+        x_batch = torch.cat(xs, dim=0)
+        B = x_batch.shape[0]
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+            g_patch, _ = vit.get_intermediate_layers(
+                x_batch, n=[23], return_class_token=True, norm=True, reshape=False)[0]
+            ctx = mce.fusion_mask_token.expand(B, mce.num_patches_kv, -1)
+            ctx = ctx.to(dtype=g_patch.dtype, device=g_patch.device)
+            bias = mce.attn_bias.to(dtype=g_patch.dtype, device=g_patch.device)
+            cbias = mce.cross_attn_bias.to(dtype=g_patch.dtype, device=g_patch.device)
+            cscale = mce.cross_scale.to(dtype=g_patch.dtype, device=g_patch.device)
+            x = g_patch
+            for block in mce.blocks:
+                x = x + block["self_attn"](x, bias)
+                x = x + cscale * block["cross_attn"](x, ctx, cbias)
+                x = x + block["ffn"](x)
+            x = mce.norm_out(x)
+        global_feat = x.mean(dim=1).cpu()
+        feats.append(global_feat)
+        if end % 400 == 0 or end >= N:
+            print(f"  fusion_full: {end}/{N}")
+    return torch.cat(feats, dim=0)[:N]
+
 
 def build_olmoearth():
     from dataload.model import load_model_direct, load_model_with_weights
@@ -205,26 +258,20 @@ def extract_olmoearth_global(model, h5_indices, batch_size=2):
     return torch.cat(feats, dim=0)[:total]
 
 
-def _load_or_extract(cache_path, extract_fn, *extract_args, label=""):
-    """Load cached .pt or run extraction and save cache."""
+def _load_or_extract(cache_path, extract_fn, label=""):
     if os.path.exists(cache_path):
         F = torch.load(cache_path, map_location="cpu")
         print(f"  {label}: loaded cached {tuple(F.shape)}")
         return F
-    F = extract_fn(*extract_args)
+    F = extract_fn()
     torch.save(F, cache_path)
     print(f"  {label}: cached to {cache_path}")
     return F
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Main
-# ═══════════════════════════════════════════════════════════════════════════
-
 def main():
-    cache_key = f"seed{SEED}_n{N_SAMPLES}"
+    ck = f"seed{SEED}_n{N_SAMPLES}"
 
-    # ── collect file paths ──
     all_imgs = sorted(glob.glob(f"{POTSDAM_DIR}/train/*.png") +
                       glob.glob(f"{POTSDAM_DIR}/val/*.png"))
     all_h5 = sorted(glob.glob(f"{OLMO_H5_DIR}/sample_*.h5"))
@@ -235,86 +282,104 @@ def main():
     olmo_indices = rng.sample(h5_indices, min(N_SAMPLES, len(h5_indices)))
     N_olmo = len(olmo_indices)
 
-    print(f"Potsdam images: {len(all_imgs)} → {N_SAMPLES}")
-    print(f"OlmoEarth h5:   {len(h5_indices)} → {N_olmo}")
+    print(f"Potsdam: {len(all_imgs)} → {N_SAMPLES}")
+    print(f"Olmo:    {len(h5_indices)} → {N_olmo}")
 
-    # ── dinov3 ──
-    print("\n=== dinov3 (vit_small) ===")
+    print("\n=== dinov3 ===")
     F_dino = _load_or_extract(
-        f"{CACHE_DIR}/F_dino_{cache_key}.pt",
-        lambda: extract_dinov3_global(build_dinov3(img_size=512), 512, img_paths),
+        f"{CACHE_DIR}/F_dino_{ck}.pt",
+        lambda: extract_dinov3_global(build_dinov3(512), 512, img_paths),
         label="dinov3")
-    print(f"  F_dino: {tuple(F_dino.shape)}")
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
+    print(f"  {tuple(F_dino.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
 
-    # ── fusion dinov3 ──
-    print("\n=== fusion dinov3 (vit_large) ===")
-    F_fusion = _load_or_extract(
-        f"{CACHE_DIR}/F_fusion_{cache_key}.pt",
-        lambda: extract_fusion_dino_global(build_fusion_dino(img_size=512), 512, img_paths),
-        label="fusion")
-    print(f"  F_fusion: {tuple(F_fusion.shape)}")
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
+    print("\n=== fusion_old ===")
+    F_fold = _load_or_extract(
+        f"{CACHE_DIR}/F_fusion_old_{ck}.pt",
+        lambda: extract_fusion_old_global(build_fusion_old(512), 512, img_paths),
+        label="fusion_old")
+    print(f"  {tuple(F_fold.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
 
-    # ── OlmoEarth ──
+    print("\n=== fusion_9999 ===")
+    F_f9999 = _load_or_extract(
+        f"{CACHE_DIR}/F_fusion_9999_{ck}.pt",
+        lambda: extract_fusion_9999_global(build_fusion_9999(512), 512, img_paths),
+        label="fusion_9999")
+    print(f"  {tuple(F_f9999.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+
+    print("\n=== fusion_23999 ===")
+    F_f2399 = _load_or_extract(
+        f"{CACHE_DIR}/F_fusion_new_{ck}.pt",
+        lambda: extract_fusion_23999_global(build_fusion_23999(512), 512, img_paths),
+        label="fusion_23999")
+    print(f"  {tuple(F_f2399.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+
+    print("\n=== fusion_full ===")
+    F_fufu = _load_or_extract(
+        f"{CACHE_DIR}/F_fusion_full_{ck}.pt",
+        lambda: extract_fusion_full_global(*build_fusion_full(), img_paths),
+        label="fusion_full")
+    print(f"  {tuple(F_fufu.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
+
     print("\n=== OlmoEarth ===")
     F_olmo = _load_or_extract(
-        f"{CACHE_DIR}/F_olmo_{cache_key}.pt",
+        f"{CACHE_DIR}/F_olmo_{ck}.pt",
         lambda: extract_olmoearth_global(build_olmoearth(), olmo_indices),
         label="olmoearth")
-    print(f"  F_olmo: {tuple(F_olmo.shape)}")
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
+    print(f"  {tuple(F_olmo.shape)}")
+    if DEVICE.type == "cuda": torch.cuda.empty_cache()
 
-    # ── mean-center + SVD ──
     def svd_spectrum(F, name):
         Fc = F - F.mean(dim=0, keepdim=True)
         print(f"  {name}: shape={tuple(F.shape)}, centering done")
         U, S, Vh = torch.linalg.svd(Fc.float(), full_matrices=False)
-        S = S / S[0]  # normalize by sigma_max
-        print(f"  {name}: SVD done, σ/σmax ∈ [{S[-1].item():.6e}, 1], len={len(S)}")
+        S = S / S[0]
+        print(f"  {name}: σ/σmax ∈ [{S[-1].item():.6e}, 1], len={len(S)}")
         return S.numpy()
 
-    S_dino   = svd_spectrum(F_dino,   "dinov3")
-    S_fusion = svd_spectrum(F_fusion, "fusion dinov3")
-    S_olmo   = svd_spectrum(F_olmo,   "OlmoEarth")
+    S_dino  = svd_spectrum(F_dino,  "dinov3")
+    S_fold  = svd_spectrum(F_fold,  "fusion_old")
+    S_f9999 = svd_spectrum(F_f9999, "fusion_9999")
+    S_f2399 = svd_spectrum(F_f2399, "fusion_23999")
+    S_fufu  = svd_spectrum(F_fufu,  "fusion_full")
+    S_olmo  = svd_spectrum(F_olmo,  "OlmoEarth")
 
-    # ── plot ──
     fig, ax = plt.subplots(1, 1, figsize=(12, 7))
 
-    x_dino   = np.arange(1, len(S_dino) + 1)
-    x_fusion = np.arange(1, len(S_fusion) + 1)
-    x_olmo   = np.arange(1, len(S_olmo) + 1)
-
-    ax.plot(x_dino, S_dino,
-            label=f"dinov3 (vit_s, D=384, N={N_SAMPLES})", lw=1.5)
-    ax.plot(x_fusion, S_fusion,
-            label=f"fusion dinov3 (vit_l, D=1024, N={N_SAMPLES})", lw=1.5)
-    ax.plot(x_olmo, S_olmo,
+    ax.plot(np.arange(1, len(S_dino) + 1),  S_dino,
+            label=f"dinov3 (vit_l, D=1024, N={N_SAMPLES})", lw=1.5)
+    ax.plot(np.arange(1, len(S_fold) + 1),  S_fold,
+            label=f"fusion old (vit_l, stage1, D=1024, N={N_SAMPLES})", lw=1.5)
+    ax.plot(np.arange(1, len(S_f9999) + 1), S_f9999,
+            label=f"fusion 9999 (vit_l, D=1024, N={N_SAMPLES})", lw=1.5)
+    ax.plot(np.arange(1, len(S_f2399) + 1), S_f2399,
+            label=f"fusion 23999 (vit_l, D=1024, N={N_SAMPLES})", lw=1.5)
+    ax.plot(np.arange(1, len(S_fufu) + 1),  S_fufu,
+            label=f"fusion 23999 full (vit+mce, D=1024, N={N_SAMPLES})", lw=1.5)
+    ax.plot(np.arange(1, len(S_olmo) + 1),  S_olmo,
             label=f"OlmoEarth (D=768, N={N_olmo})", lw=1.5)
 
-    # y-axis: fit to data, no below-curve whitespace
-    all_S = np.concatenate([S_dino, S_fusion, S_olmo])
+    all_S = np.concatenate([S_dino, S_fold, S_f9999, S_f2399, S_fufu, S_olmo])
     y_min = all_S.min()
-    y_max = 1.0  # normalized by sigma_max, all start at 1
-    ax.set_ylim(bottom=y_min * 0.8, top=y_max * 1.05)
-
+    # ax.set_ylim(bottom=y_min * 0.8, top=1.05)
+    ax.set_ylim(bottom=1e-3, top=1.05)
     ax.set_yscale("log")
     ax.set_xlabel("Singular Value Index", fontsize=13)
     ax.set_ylabel("σ / σ_max (log scale)", fontsize=13)
     ax.set_title(f"Normalized Singular Value Spectrum (mean-centered, σ/σmax, N≈{N_SAMPLES})",
                  fontsize=14, fontweight="bold")
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     out_path = f"{OUT_DIR}/task3_svd_spectrum.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
     print(f"\nSaved: {out_path}")
-
-    print("\nDone. Cached features in:", CACHE_DIR)
+    print(f"Cached in: {CACHE_DIR}")
 
 
 if __name__ == "__main__":
