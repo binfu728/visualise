@@ -1,6 +1,6 @@
 """
 Task 1 — Layer Cosine Similarity: dinov3 + 3 fusion timepoints.
-Rows: dinov3, fusion_old (stage1), fusion_9999, fusion_23999.
+Rows: dinov3, fusion_old (stage1), fusion_31999, fusion_23999.
 Columns: first layer, middle layer, last layer cosine maps, PCA of last layer.
 Single potsdam image, 512→3200 resize, fixed reference patch.
 """
@@ -33,7 +33,7 @@ from dinov3.models.vision_transformer import vit_small, vit_large
 VITS_CKPT    = "/mnt/ht2-nas2/models/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 FUSION_CKPT  = "/mnt/ht2-nas2/00-model/00-common/weights/20260709/weights.pth"
 NEW_CKPT     = "/mnt/qh2-nas3/00-model/00-limx/Dinov3/ckpt/stage2+stage3-zhejiang/23999.pth"
-NEW2_CKPT    = "/mnt/qh2-nas3/00-model/00-limx/Dinov3/ckpt/stage2+stage3-zhejiang/9999.pth"
+NEW2_CKPT    = "/mnt/qh2-nas3/00-model/00-limx/Dinov3/ckpt/stage2+stage3-zhejiang/31999.pth"
 POTSDAM_DIR  = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir"
 OUT_DIR      = "/mnt/qh2-nas3/00-model/00-fb/visualise"
 
@@ -101,14 +101,14 @@ def build_fusion_new():
     return vit.to(DEVICE).eval()
 
 
-def build_fusion_9999():
+def build_fusion_31999():
     vit = vit_large(patch_size=PATCH_SIZE, img_size=IMG_SIZE,
                     n_storage_tokens=4, layerscale_init=1e-5)
     ckpt = torch.load(NEW2_CKPT, map_location="cpu", weights_only=False)
     sd = {k[len("backbone."):]: v for k, v in ckpt.items()
           if isinstance(v, torch.Tensor) and k.startswith("backbone.")}
     info = vit.load_state_dict(sd, strict=False)
-    print(f"[fusion_9999] matched={len(sd)-len(info.unexpected_keys)} "
+    print(f"[fusion_31999] matched={len(sd)-len(info.unexpected_keys)} "
           f"missing={len(info.missing_keys)} unexpected={len(info.unexpected_keys)}")
     return vit.to(DEVICE).eval()
 
@@ -140,7 +140,7 @@ def main():
     # img_path = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir/train/2_10_2048_4096_2560_4608.png"
     # img_path = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir/train/2_10_1536_2560_2048_3072.png"
     # img_path = "/mnt/qh2-nas3/00-model/00-limx/datasets/potsdam/img_dir/train/2_10_4096_2048_4608_2560.png"
-    img_path = "/mnt/ht2-nas2/00-model/guantp/dino/mm_dino/data/DIOR-R/JPEGImages-trainval/00086.jpg"
+    img_path = "/mnt/ht2-nas2/00-model/guantp/dino/mm_dino/data/DIOR-R/JPEGImages-trainval/00050.jpg"
     print(f"Image: {img_path}")
 
     x_normed = load_potsdam_image(img_path, IMG_SIZE).to(DEVICE)
@@ -151,7 +151,7 @@ def main():
     dino  = build_dinov3()
     fold  = build_fusion_old()
     f2399 = build_fusion_new()
-    f9999 = build_fusion_9999()
+    f31999 = build_fusion_31999()
 
     dino_layers  = [0, 11, 23]
     vit_l_layers = [0, 11, 23]
@@ -168,28 +168,28 @@ def main():
             x_normed, n=vit_l_layers, reshape=True, norm=True)
         f2399_feats  = f2399.get_intermediate_layers(
             x_normed, n=vit_l_layers, reshape=True, norm=True)
-        f9999_feats  = f9999.get_intermediate_layers(
+        f31999_feats  = f31999.get_intermediate_layers(
             x_normed, n=vit_l_layers, reshape=True, norm=True)
 
     dino_sims  = [cosine_map(f[0], ref_y, ref_x) for f in dino_feats]
     fold_sims  = [cosine_map(f[0], ref_y, ref_x) for f in fold_feats]
     f2399_sims = [cosine_map(f[0], ref_y, ref_x) for f in f2399_feats]
-    f9999_sims = [cosine_map(f[0], ref_y, ref_x) for f in f9999_feats]
+    f31999_sims = [cosine_map(f[0], ref_y, ref_x) for f in f31999_feats]
 
     dino_dims  = [int(f.shape[1]) for f in dino_feats]
     fold_dims  = [int(f.shape[1]) for f in fold_feats]
     f2399_dims = [int(f.shape[1]) for f in f2399_feats]
-    f9999_dims = [int(f.shape[1]) for f in f9999_feats]
+    f31999_dims = [int(f.shape[1]) for f in f31999_feats]
 
     # ── PCA on last-layer features ──
     dino_last  = dino_feats[-1][0]
     fold_last  = fold_feats[-1][0]
     f2399_last = f2399_feats[-1][0]
-    f9999_last = f9999_feats[-1][0]
+    f31999_last = f31999_feats[-1][0]
     dino_pca  = pca_components(dino_last.cpu().numpy())
     fold_pca  = pca_components(fold_last.cpu().numpy())
     f2399_pca = pca_components(f2399_last.cpu().numpy())
-    f9999_pca = pca_components(f9999_last.cpu().numpy())
+    f31999_pca = pca_components(f31999_last.cpu().numpy())
 
     fig = plt.figure(figsize=(30, 32))
     gs = GridSpec(5, 4, figure=fig, hspace=0.3, wspace=0.25)
@@ -238,21 +238,21 @@ def main():
                  fontsize=12, fontweight="bold")
     ax.axis("off")
 
-    # ── fusion_9999 row ──
+    # ── fusion_31999 row ──
     for col in range(3):
         ax = fig.add_subplot(gs[3, col])
-        sim_up = cv2.resize(f9999_sims[col], (IMG_SIZE, IMG_SIZE),
+        sim_up = cv2.resize(f31999_sims[col], (IMG_SIZE, IMG_SIZE),
                             interpolation=cv2.INTER_CUBIC)
         im = ax.imshow(sim_up, cmap="viridis", vmin=0, vmax=1.0)
         ax.plot(px, py, "w+", markersize=20, markeredgewidth=4)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_title(f"fusion 9999 — {labels[col]} (blk {vit_l_layers[col]}, D={f9999_dims[col]})",
+        ax.set_title(f"fusion 31999 — {labels[col]} (blk {vit_l_layers[col]}, D={f31999_dims[col]})",
                      fontsize=12, fontweight="bold")
         ax.axis("off")
     ax = fig.add_subplot(gs[3, 3])
-    ax.imshow(cv2.resize(f9999_pca, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC))
+    ax.imshow(cv2.resize(f31999_pca, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_CUBIC))
     ax.plot(px, py, "w+", markersize=20, markeredgewidth=4)
-    ax.set_title(f"fusion 9999 — {labels[3]} (blk 23, D={f9999_dims[2]})",
+    ax.set_title(f"fusion 31999 — {labels[3]} (blk 23, D={f31999_dims[2]})",
                  fontsize=12, fontweight="bold")
     ax.axis("off")
 
@@ -282,8 +282,8 @@ def main():
         print(f"  dinov3       layer {dino_layers[i]}: sim ∈ [{s.min():.3f}, {s.max():.3f}]")
     for i, s in enumerate(fold_sims):
         print(f"  fusion_old   layer {vit_l_layers[i]}: sim ∈ [{s.min():.3f}, {s.max():.3f}]")
-    for i, s in enumerate(f9999_sims):
-        print(f"  fusion_9999  layer {vit_l_layers[i]}: sim ∈ [{s.min():.3f}, {s.max():.3f}]")
+    for i, s in enumerate(f31999_sims):
+        print(f"  fusion_31999  layer {vit_l_layers[i]}: sim ∈ [{s.min():.3f}, {s.max():.3f}]")
     for i, s in enumerate(f2399_sims):
         print(f"  fusion_23999 layer {vit_l_layers[i]}: sim ∈ [{s.min():.3f}, {s.max():.3f}]")
 
