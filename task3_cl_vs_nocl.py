@@ -8,7 +8,7 @@ Color scheme:
   9999 = solid, 23999 = dashed.
 """
 
-import sys, types, random, glob, os, numpy as np, torch, cv2
+import sys, types, random, glob, os, numpy as np, torch, torch.nn as nn, cv2
 import pandas as pd
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -42,6 +42,21 @@ POTSDAM_STD  = np.array([36.295481104983764, 35.3808408869616, 36.78625007116312
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+class UPHead(nn.Module):
+    def __init__(self, in_dim=768, out_dim=1024):
+        super().__init__()
+        self.decoder = nn.Sequential(nn.Linear(in_dim, out_dim), nn.LayerNorm(out_dim))
+    def forward(self, x):
+        return self.decoder(x)
+
+def load_uphead(ckpt_path):
+    head = UPHead(768, 1024)
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = {k[len("embed_head."):]: v for k,v in ckpt.items()
+          if isinstance(v, torch.Tensor) and k.startswith("embed_head.")}
+    head.load_state_dict(sd, strict=True)
+    return head.to(DEVICE).eval()
 
 def _unwrap(ckpt):
     for c in ("model","state_dict","teacher","student"):
@@ -164,11 +179,26 @@ def main():
         print(f"  {tuple(F.shape)}")
         if DEVICE.type=="cuda": torch.cuda.empty_cache()
 
-    print("\n=== OlmoEarth ===")
-    Fs["olmo"] = _load_or_extract(
+    print("\n=== OlmoEarth (raw, cached) ===")
+    F_olmo_raw = _load_or_extract(
         f"{CACHE_DIR}/F_olmo_{ck}.pt",
         lambda: extract_olmoearth(build_olmoearth(), olmo_idx), "olmo")
-    print(f"  {tuple(Fs['olmo'].shape)}")
+    print(f"  raw: {tuple(F_olmo_raw.shape)}")
+
+    # Apply UPHead from each checkpoint to OlmoEarth features
+    olmo_configs = [
+        ("olmo_cl_9999",    CL_9999,     "olmo hr 9999 (CL)"),
+        ("olmo_cl_23999",   CL_23999,    "olmo hr 23999 (CL)"),
+        ("olmo_nocl_9999",  NO_CL_9999,  "olmo no_cl hr 9999"),
+        ("olmo_nocl_23999", NO_CL_23999, "olmo no_cl hr 23999"),
+    ]
+    Fs_olmo = {}
+    for suffix, ckpt_path, label in olmo_configs:
+        head = load_uphead(ckpt_path)
+        with torch.no_grad():
+            F_1024 = head(F_olmo_raw.to(DEVICE)).cpu()
+        Fs_olmo[suffix] = F_1024
+        print(f"  {label}: {tuple(F_1024.shape)}")
 
     # SVD
     def svd(F, name):
@@ -180,53 +210,61 @@ def main():
 
     spectra = {}
     for suffix, _, label in jobs:
-        F = _load_or_extract(f"{CACHE_DIR}/F_{suffix}_{ck}.pt", lambda s=suffix: torch.load(f"{CACHE_DIR}/F_{s}_{ck}.pt"), label)
+        F = torch.load(f"{CACHE_DIR}/F_{suffix}_{ck}.pt", map_location="cpu")
         spectra[suffix] = svd(F, label)
-    spectra["olmo"] = svd(torch.load(f"{CACHE_DIR}/F_olmo_{ck}.pt"), "OlmoEarth")
+    for suffix, _, label in olmo_configs:
+        spectra[suffix] = svd(Fs_olmo[suffix], label)
 
     # Plot with color scheme
-    # HR(CL)=blue, Fusion(CL)=red, HR(no_cl)=cyan, Fusion(no_cl)=orange
-    # 9999=solid, 23999=dashed; dinov3=green, olmo=purple
+    # HR(CL)=blue, Fusion(CL)=crimson, HR(no_cl)=cyan, Fusion(no_cl)=darkorange
+    # 9999=solid, 23999=dashed; dinov3=green
+    # OlmoEarth via UPHead: 4 gradient reds (CL=lighter, no_cl=darker)
     C = {
-        "dino":          ("forestgreen", "-"),
-        "cl_hr_9999":    ("royalblue",   "-"),
-        "cl_hr_23999":   ("royalblue",   "--"),
-        "cl_fus_9999":   ("crimson",     "-"),
-        "cl_fus_23999":  ("crimson",     "--"),
-        "nocl_hr_9999":  ("darkturquoise","-"),
-        "nocl_hr_23999": ("darkturquoise","--"),
-        "nocl_fus_9999": ("darkorange",  "-"),
-        "nocl_fus_23999":("darkorange",  "--"),
-        "olmo":          ("purple",      "-"),
+        "dino":              ("forestgreen",  "-"),
+        "cl_hr_9999":        ("royalblue",    "-"),
+        "cl_hr_23999":       ("royalblue",    "--"),
+        "cl_fus_9999":       ("crimson",      "-"),
+        "cl_fus_23999":      ("crimson",      "--"),
+        "nocl_hr_9999":      ("darkturquoise","-"),
+        "nocl_hr_23999":     ("darkturquoise","--"),
+        "nocl_fus_9999":     ("darkorange",   "-"),
+        "nocl_fus_23999":    ("darkorange",   "--"),
+        "olmo_cl_9999":      ("#FF6B6B",      "-"),   # light red
+        "olmo_cl_23999":     ("#FF6B6B",      "--"),
+        "olmo_nocl_9999":    ("#A02020",      "-"),   # dark red
+        "olmo_nocl_23999":   ("#A02020",      "--"),
     }
     L = {
-        "dino":          "dinov3 (D=1024)",
-        "cl_hr_9999":    "hr 9999 (CL)",
-        "cl_hr_23999":   "hr 23999 (CL)",
-        "cl_fus_9999":   "fusion 9999 (CL)",
-        "cl_fus_23999":  "fusion 23999 (CL)",
-        "nocl_hr_9999":  "no_cl hr 9999",
-        "nocl_hr_23999": "no_cl hr 23999",
-        "nocl_fus_9999": "no_cl fusion 9999",
-        "nocl_fus_23999":"no_cl fusion 23999",
-        "olmo":          "OlmoEarth (D=768)",
+        "dino":              "dinov3 (D=1024)",
+        "cl_hr_9999":        "hr 9999 (CL)",
+        "cl_hr_23999":       "hr 23999 (CL)",
+        "cl_fus_9999":       "fusion 9999 (CL)",
+        "cl_fus_23999":      "fusion 23999 (CL)",
+        "nocl_hr_9999":      "no_cl hr 9999",
+        "nocl_hr_23999":     "no_cl hr 23999",
+        "nocl_fus_9999":     "no_cl fusion 9999",
+        "nocl_fus_23999":    "no_cl fusion 23999",
+        "olmo_cl_9999":      "olmo→UPHead hr 9999 (CL)",
+        "olmo_cl_23999":     "olmo→UPHead hr 23999 (CL)",
+        "olmo_nocl_9999":    "olmo→UPHead no_cl hr 9999",
+        "olmo_nocl_23999":   "olmo→UPHead no_cl hr 23999",
     }
 
     fig, ax = plt.subplots(figsize=(14, 8))
     order = ["dino","cl_hr_9999","cl_fus_9999","cl_hr_23999","cl_fus_23999",
-             "nocl_hr_9999","nocl_fus_9999","nocl_hr_23999","nocl_fus_23999","olmo"]
+             "nocl_hr_9999","nocl_fus_9999","nocl_hr_23999","nocl_fus_23999",
+             "olmo_cl_9999","olmo_cl_23999","olmo_nocl_9999","olmo_nocl_23999"]
     for key in order:
         S = spectra[key]
         color, ls = C[key]
         ax.plot(np.arange(1,len(S)+1), S, color=color, ls=ls, lw=1.5, label=L[key])
 
     all_S = np.concatenate([spectra[k] for k in order])
-    # ax.set_ylim(bottom=all_S.min()*0.8, top=1.05)
-    ax.set_ylim(bottom=1e-3, top=1.05)
+    ax.set_ylim(bottom=1e-4, top=1.05)
     ax.set_yscale("log"); ax.set_xlabel("Singular Value Index", fontsize=13)
     ax.set_ylabel("σ / σ_max (log)", fontsize=13)
-    ax.set_title(f"SVD Spectrum — CL vs No-CL (σ/σmax, N={N})", fontsize=14, fontweight="bold")
-    ax.legend(fontsize=9, ncol=2); ax.grid(True, alpha=0.3)
+    ax.set_title(f"SVD Spectrum — CL vs No-CL + OlmoEarth via UPHead (σ/σmax, N={N})", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=8, ncol=2); ax.grid(True, alpha=0.3)
     plt.tight_layout()
     out = f"{OUT_DIR}/task3_cl_vs_nocl.png"
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
